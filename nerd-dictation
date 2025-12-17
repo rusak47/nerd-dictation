@@ -31,6 +31,14 @@ from types import (
     ModuleType,
 )
 
+# flag register to signal for actions
+class DictationControl:
+    __slots__ = ("clear_buffer",)
+
+    def __init__(self):
+        self.clear_buffer = False
+DICTATION_CONTROL = DictationControl()
+
 TEMP_COOKIE_NAME = "nerd-dictation.cookie"
 
 USER_CONFIG_DIR = "nerd-dictation"
@@ -124,6 +132,9 @@ def execfile(filepath: str, mod: Optional[ModuleType] = None) -> Optional[Module
 
     # No error suppression, just ensure `sys.modules[mod_name]` is properly restored in the case of an error.
     try:
+        # inject flag register to user config
+        mod.DICTATION_CONTROL = DICTATION_CONTROL
+
         # `mypy` doesn't know about this function.
         mod_spec.loader.exec_module(mod)  # type: ignore
     finally:
@@ -1038,6 +1049,12 @@ def text_from_vosk_pipe(
             text_curr = process_fn(text)
         else:
             text_curr = process_fn(" ".join(text_list + [text]))
+
+            if DICTATION_CONTROL.clear_buffer:
+               DICTATION_CONTROL.clear_buffer = False
+               text_list.clear()
+               handled_any = True
+               return
 
         if text_curr != text_prev:
             match = min(len(text_curr), len(text_prev))
