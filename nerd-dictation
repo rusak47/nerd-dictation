@@ -814,7 +814,7 @@ class from_words_to_digits:
 #
 
 
-def process_text_with_user_config(user_config: ModuleType, text: str) -> str:
+def process_text_with_user_config(user_config: ModuleType, text: str, prev_text: str = None) -> str:
     process_fn_name = "nerd_dictation_process"
     process_fn = getattr(user_config, process_fn_name)
     if process_fn is None:
@@ -822,7 +822,7 @@ def process_text_with_user_config(user_config: ModuleType, text: str) -> str:
         return text
 
     try:
-        text = process_fn(text)
+        text = process_fn(text, prev_text)
     except Exception as ex:
         sys.stderr.write("Failed to run %r with error %s\n" % (user_config, str(ex)))
         sys.exit(1)
@@ -1048,15 +1048,18 @@ def text_from_vosk_pipe(
         if progressive_continuous:
             text_curr = process_fn(text)
         else:
-            text_curr = process_fn(" ".join(text_list + [text]))
+            text_curr = process_fn(" ".join(text_list + [text]), text_prev)
 
             if DICTATION_CONTROL.clear_buffer:
                DICTATION_CONTROL.clear_buffer = False
                text_list.clear()
+               text_prev = ""
+               text_curr = ""
                handled_any = True
                return
 
         if text_curr != text_prev:
+            print(f"prev: {text_prev}; curr: {text_curr}")
             match = min(len(text_curr), len(text_prev))
             for i in range(min(len(text_curr), len(text_prev))):
                 if text_curr[i] != text_prev[i]:
@@ -1072,7 +1075,9 @@ def text_from_vosk_pipe(
             if progressive_continuous:
                 text_prev = ""
             else:
-                text_list.append(text)
+                # handle text per sentence
+                text_list.clear()
+                text_list.append(text_curr)
 
         handled_any = True
 
@@ -1381,7 +1386,7 @@ def main_begin(
 
     process_fn_is_first = True
 
-    def process_fn(text: str) -> str:
+    def process_fn(text: str, prev_text:str = None) -> str:
         nonlocal user_config
         nonlocal process_fn_is_first
 
@@ -1412,7 +1417,7 @@ def main_begin(
         # User text post processing (when found).
         #
         if user_config is not None:
-            text = process_text_with_user_config(user_config, text)
+            text = process_text_with_user_config(user_config, text, prev_text)
 
         if is_run_on:
             # This is a signal that the end of the sentence has been reached.
