@@ -30,6 +30,34 @@ from typing import (
 from types import (
     ModuleType,
 )
+import signal
+import subprocess
+import tempfile
+import atexit
+
+STATE_DIR = os.path.join(tempfile.gettempdir(), "nerd-dictation")
+
+def _ensure_state_dir():
+    os.makedirs(STATE_DIR, exist_ok=True)
+
+def _pidfile(lang: str) -> str:
+    return os.path.join(STATE_DIR, f"nerd-dictation.{lang}.pid")
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+def _process_alive_from_pidfile(pidfile: str) -> bool:
+    """Check if process from PID file is alive."""
+    try:
+        with open(pidfile, "r", encoding="utf-8") as f:
+            pid = int(f.read().strip())
+        return True
+    except OSError:
+        return False
 
 # flag register to signal for actions
 class DictationControl:
@@ -1292,6 +1320,7 @@ def main_begin(
     *,
     vosk_model_dir: str,
     path_to_cookie: str = "",
+    lang: str = "",
     pulse_device_name: str = "",
     sample_rate: int = 44100,
     input_method: str = "PAREC",
@@ -1329,8 +1358,23 @@ def main_begin(
     #
     # Initialize the recording state and perform some sanity checks.
     #
+    _ensure_state_dir()
+
     if not path_to_cookie:
-        path_to_cookie = os.path.join(tempfile.gettempdir(), TEMP_COOKIE_NAME)
+        #path_to_cookie = os.path.join(tempfile.gettempdir(), TEMP_COOKIE_NAME)
+        path_to_cookie = _pidfile(lang)
+    print(f"{path_to_cookie}")
+
+    # Check if another instance of this language is already running
+    if os.path.exists(path_to_cookie):
+        try:
+            with open(path_to_cookie, "r", encoding="utf-8") as fh:
+                old_pid = int(fh.read().strip())
+            if _process_alive(old_pid):
+                sys.stderr.write(f"Language '{lang}' is already running (PID: {old_pid})\n")
+                sys.exit(1)
+        except Exception:
+            pass
 
     is_run_on = False
     if punctuate_from_previous_timeout > 0.0:
@@ -1544,6 +1588,51 @@ def main_suspend(
     else:  # Resume.
         os.kill(pid, signal.SIGCONT)
 
+def cmd_status(args):
+    """Show status of all dictation instances."""
+    _ensure_state_dir()
+
+    print("\n═══ Nerd-Dictation Status ═══\n")
+    found_any = False
+
+    for fn in sorted(os.listdir(STATE_DIR)):
+        if not fn.startswith("nerd-dictation.") or not fn.endswith(".pid"):
+            continue
+
+        lang = fn.replace("nerd-dictation.", "").replace(".pid", "")
+        path = os.path.join(STATE_DIR, fn)
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                pid = int(f.read().strip())
+
+            if not _process_alive(pid):
+                print(f"  [{lang}]: ✗ stale (PID {pid} not running)")
+                continue
+
+            # Check if suspended
+            try:
+                with open(f"/proc/{pid}/status", "r") as f:
+                    status = f.read()
+                    if "State:\tT" in status:  # T = stopped/traced
+                        state = "⏸ SUSPENDED"
+                    else:
+                        state = "▶ ACTIVE"
+            except:
+                state = "? unknown"
+
+            print(f"  [{lang}]: {state} (PID: {pid})")
+            found_any = True
+
+        except Exception as e:
+            print(f"  [{lang}]: ✗ error ({e})")
+
+    if not found_any:
+        print("  No instances running\n")
+    else:
+        print()
+
+    sys.exit(0)
 
 def argparse_generic_command_cookie(subparse: argparse.ArgumentParser) -> None:
     subparse.add_argument(
@@ -1569,6 +1658,13 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
     )
 
     argparse_generic_command_cookie(subparse)
+    subparse_creat_begin_add_arguments(subparse)
+
+def subparse_creat_begin_add_arguments(subparse):
+    subparse.add_argument("--lang",
+                   default="",
+                   help="Language code (e.g. en, ru)"
+                   )
 
     subparse.add_argument(
         "--config",
@@ -1886,6 +1982,7 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
             suspend_on_start=args.suspend_on_start,
             verbose=args.verbose,
             vosk_grammar_file=args.vosk_grammar_file,
+            lang=args.lang,
         ),
     )
 
@@ -1973,6 +2070,63 @@ def argparse_create_resume(subparsers: "argparse._SubParsersAction[argparse.Argu
         ),
     )
 
+def cmd_switch(args):
+    _ensure_state_dir()
+    target_lang = args.lang
+
+    # Suspend / resume existing dictation processes
+    for fn in os.listdir(STATE_DIR):
+        if not fn.startswith("nerd-dictation.") or not fn.endswith(".pid"):
+            continue
+
+        lang = fn.split(".")[1]
+        path = os.path.join(STATE_DIR, fn)
+
+        try:
+            with open(path) as f:
+                pid = int(f.read().strip())
+        except Exception:
+            continue
+
+        if not _process_alive(pid):
+            continue
+
+        if lang == target_lang:
+            os.kill(pid, signal.SIGCONT)
+        else:
+            os.kill(pid, signal.SIGSTOP)
+
+    print(f"{target_lang}:{os.path.exists(_pidfile(target_lang))}")
+    # Start target language if not running
+    if not os.path.exists(_pidfile(target_lang)):
+        subprocess.Popen(
+            ["nerd-dictation", "--lang", target_lang],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    sys.exit(0)
+
+def argparse_create_switch(subparsers):
+    p = subparsers.add_parser(
+        "switch",
+        help="Switch active dictation language (suspend others)",
+    )
+
+    argparse_generic_command_cookie(p)
+    subparse_creat_begin_add_arguments(p)
+
+    p.set_defaults(func=cmd_switch)
+
+def argparse_create_status(subparsers):
+    """Status command parser."""
+    p = subparsers.add_parser(
+        "status",
+        help="Show all running dictation instances",
+        description="Display status of all nerd-dictation language instances.",
+    )
+    p.set_defaults(func=cmd_status)
 
 def argparse_create() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
@@ -1986,6 +2140,9 @@ def argparse_create() -> argparse.ArgumentParser:
 
     argparse_create_suspend(subparsers)
     argparse_create_resume(subparsers)
+
+    argparse_create_switch(subparsers)
+    argparse_create_status(subparsers)
 
     return parser
 
