@@ -63,7 +63,7 @@ def _process_alive_from_pidfile(pidfile: str) -> bool:
 # flag register to signal for actions
 class DictationControl:
     __slots__ = ("clear_buffer", "last_activity_time", "buffer_timeout", "_timer", "_lock",
-                 "_cleanup_callback", "_verbose")
+                 "_cleanup_callback", "_verbose", "suspend_timeout", "_suspend_timer")
 
     def __init__(self):
         self.clear_buffer = False
@@ -74,17 +74,27 @@ class DictationControl:
         self._cleanup_callback = None  # Will be set by main_begin
         self._verbose = 0
 
+        self.suspend_timeout = 0.0
+        self._suspend_timer = None
+
     def set_cleanup_callback(self, callback, verbose=0):
         """Set the callback function that will clean up the buffer"""
         with self._lock:
             self._cleanup_callback = lambda: callback(self)
             self._verbose = verbose
 
+    def set_suspend_timeout(self, timeout):
+        """Set the suspend timeout value"""
+        with self._lock:
+            self.suspend_timeout = timeout
+
     def update_activity(self):
         """Update the last activity timestamp and reset timer"""
         with self._lock:
             self.last_activity_time = time.time()
             self._restart_timer()
+
+            self._restart_suspend_timer()
 
     def _restart_timer(self):
         """Internal method to restart the timer (must be called with lock held)"""
@@ -142,6 +152,41 @@ class DictationControl:
     def set_verbose(self, verbose:bool):
         with self._lock:
             self._verbose = verbose
+
+    def _restart_suspend_timer(self):
+        """Internal method to restart the suspend timer"""
+        if self._suspend_timer is not None:
+            self._suspend_timer.cancel()
+            self._suspend_timer = None
+
+        if self.suspend_timeout > 0:
+            self._suspend_timer = threading.Timer(self.suspend_timeout, self._on_suspend_timeout)
+            self._suspend_timer.daemon = True
+            self._suspend_timer.start()
+
+    def _on_suspend_timeout(self):
+        """Called when suspend timer expires - just sets a flag"""
+        if self._verbose >= 2:
+            sys.stderr.write(f"Suspend timeout reached ({self.suspend_timeout}s)\n")
+        # Just trigger suspension via signal to self
+        os.kill(os.getpid(), signal.SIGUSR1)
+
+    def start_suspend_timer(self):
+        """Start or restart the suspend timer"""
+        if self._verbose >= 2:
+            sys.stderr.write("Starting suspend timer\n")
+        with self._lock:
+            self.last_activity_time = time.time()
+            self._restart_suspend_timer()
+
+    def stop_suspend_timer(self):
+        """Stop the suspend timer"""
+        if self._verbose >= 2:
+            sys.stderr.write("Stopping suspend timer\n")
+        with self._lock:
+            if self._suspend_timer is not None:
+                self._suspend_timer.cancel()
+                self._suspend_timer = None
 
 DICTATION_CONTROL = DictationControl()
 
@@ -1123,9 +1168,12 @@ def text_from_vosk_pipe(
     # Track this to prevent excessive load when the "partial" result doesn't change.
     json_text_partial_prev = ""
 
-    # start auto cleanup timer if not sspending, otherwise it will be called on resume
+    # start auto cleanup timer if not suspending, otherwise it will be called on resume
     if not suspend_on_start and DICTATION_CONTROL.buffer_timeout > 0:
         DICTATION_CONTROL.start_timer()
+
+    if not suspend_on_start and DICTATION_CONTROL.suspend_timeout > 0:
+        DICTATION_CONTROL.start_suspend_timer()
 
     # -----------------------------
     # Utilities for Text Processing
@@ -1161,6 +1209,7 @@ def text_from_vosk_pipe(
             text_list.clear()
 
         DICTATION_CONTROL.stop_timer()
+        DICTATION_CONTROL.stop_suspend_timer()
 
     def handle_fn_wrapper(text: str, is_partial_arg: bool) -> None:
         nonlocal handled_any
@@ -1317,6 +1366,9 @@ def text_from_vosk_pipe(
         if DICTATION_CONTROL.buffer_timeout > 0:
             DICTATION_CONTROL.start_timer()
 
+        if DICTATION_CONTROL.suspend_timeout > 0:
+            DICTATION_CONTROL.start_suspend_timer()
+
     def handle_sig_reload_from_hup(_signum: int, _frame: Optional[FrameType]) -> None:
         if verbose >= 1:
             sys.stderr.write("Reload.\n")
@@ -1439,6 +1491,7 @@ def main_begin(
     numbers_no_suffix: bool = False,
     timeout: float = 0.0,
     buffer_timeout: float = 0.0,
+    suspend_timeout: float = 0.0,
     idle_time: float = 0.0,
     delay_exit: float = 0.0,
     punctuate_from_previous_timeout: float = 0.0,
@@ -1470,7 +1523,7 @@ def main_begin(
     if not path_to_cookie:
         path_to_cookie = _pidfile(lang)
     if verbose >= 1:
-        sys.stderr.write(f"Path to process cookie: {path_to_cookie}")
+        sys.stderr.write(f"Path to process cookie: {path_to_cookie}\n")
 
     # Check if another instance of this language is already running
     if os.path.exists(path_to_cookie):
@@ -1507,8 +1560,11 @@ def main_begin(
 
     DICTATION_CONTROL.set_verbose(verbose)
     DICTATION_CONTROL.set_timeout(buffer_timeout)
+    DICTATION_CONTROL.set_suspend_timeout(suspend_timeout)
     if buffer_timeout > 0 and verbose >= 1:
         sys.stderr.write(f"Buffer auto-clear enabled: {buffer_timeout}s timeout\n")
+    if suspend_timeout > 0 and verbose >= 1:
+        sys.stderr.write(f"Process auto-suspend on idle timeout enabled: {suspend_timeout}s timeout\n")
 
     #
     # Start recording the output file.
@@ -1749,7 +1805,7 @@ def cmd_status(args):
     sys.exit(0)
 
 
-def cmd_switch_suspend(args):
+def cmd_suspend(args):
     """Suspend all running dictation instances."""
     _ensure_state_dir()
 
@@ -1771,7 +1827,7 @@ def cmd_switch_suspend(args):
     sys.exit(0)
 
 
-def cmd_switch_stop(args):
+def cmd_cancel(args):
     """Stop all running dictation instances."""
     _ensure_state_dir()
 
@@ -1823,25 +1879,6 @@ def cmd_switch(args):
 
     sys.exit(0)
 
-def argparse_create_switch_suspend(subparsers):
-    """Switch suspend command parser."""
-    p = subparsers.add_parser(
-        "switch-suspend",
-        help="Suspend all dictation instances",
-        description="Suspends all running nerd-dictation instances.",
-    )
-    p.set_defaults(func=cmd_switch_suspend)
-
-
-def argparse_create_switch_stop(subparsers):
-    """Switch stop command parser."""
-    p = subparsers.add_parser(
-        "switch-stop",
-        help="Stop all dictation instances",
-        description="Stops all running nerd-dictation instances.",
-    )
-    p.set_defaults(func=cmd_switch_stop)
-
 def argparse_generic_command_cookie(subparse: argparse.ArgumentParser) -> None:
     subparse.add_argument(
         "--cookie",
@@ -1852,7 +1889,6 @@ def argparse_generic_command_cookie(subparse: argparse.ArgumentParser) -> None:
         help="Location for writing a temporary cookie (this file is monitored to begin/end dictation).",
         required=False,
     )
-
 
 def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
     subparse = subparsers.add_parser(
@@ -1884,6 +1920,21 @@ def subparse_creat_begin_add_arguments(subparse):
             "Automatically clear the text buffer after this many seconds of inactivity.\n"
             "Each language instance has its own timer.\n"
             "Useful for starting fresh sentences after pauses (zero disables)."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--suspend-timeout",
+        dest="suspend_timeout",
+        default=0.0,
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "Automatically suspend the process after this many seconds of inactivity.\n"
+            "This is useful to save CPU when not actively dictating.\n"
+            "The process can be resumed with 'nerd-dictation resume' or language switching.\n"
+            "Should be longer than --buffer-cleanup-timeout (zero disables)."
         ),
         required=False,
     )
@@ -2196,6 +2247,7 @@ def subparse_creat_begin_add_arguments(subparse):
             numbers_no_suffix=args.numbers_no_suffix,
             timeout=args.timeout,
             buffer_timeout=args.buffer_timeout,
+            suspend_timeout=args.suspend_timeout,
             idle_time=min(args.idle_time, 0.5),
             delay_exit=args.delay_exit,
             punctuate_from_previous_timeout=args.punctuate_from_previous_timeout,
@@ -2239,11 +2291,7 @@ def argparse_create_cancel(subparsers: "argparse._SubParsersAction[argparse.Argu
 
     argparse_generic_command_cookie(subparse)
 
-    subparse.set_defaults(
-        func=lambda args: main_cancel(
-            path_to_cookie=args.path_to_cookie,
-        ),
-    )
+    subparse.set_defaults(func=cmd_cancel)
 
 
 def argparse_create_suspend(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
@@ -2261,13 +2309,7 @@ def argparse_create_suspend(subparsers: "argparse._SubParsersAction[argparse.Arg
 
     argparse_generic_command_cookie(subparse)
 
-    subparse.set_defaults(
-        func=lambda args: main_suspend(
-            path_to_cookie=args.path_to_cookie,
-            suspend=True,
-            verbose=1,
-        ),
-    )
+    subparse.set_defaults(func=cmd_suspend)
 
 
 def argparse_create_resume(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
@@ -2327,8 +2369,6 @@ def argparse_create() -> argparse.ArgumentParser:
     argparse_create_resume(subparsers)
 
     argparse_create_switch(subparsers)
-    argparse_create_switch_suspend(subparsers)
-    argparse_create_switch_stop(subparsers)
     argparse_create_status(subparsers)
 
     return parser
