@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading # for buffer auto cleaning timer
 
 # Types.
 from typing import (
@@ -61,10 +62,80 @@ def _process_alive_from_pidfile(pidfile: str) -> bool:
 
 # flag register to signal for actions
 class DictationControl:
-    __slots__ = ("clear_buffer",)
+    __slots__ = ("clear_buffer", "last_activity_time", "buffer_timeout", "_timer", "_lock",
+                 "_cleanup_callback", "_verbose")
 
     def __init__(self):
         self.clear_buffer = False
+        self.last_activity_time = time.time()
+        self.buffer_timeout = 0.0  # 0 means disabled
+        self._timer = None
+        self._lock = threading.Lock()
+        self._cleanup_callback = None  # Will be set by main_begin
+        self._verbose = 0
+
+    def set_cleanup_callback(self, callback, verbose=0):
+        """Set the callback function that will clean up the buffer"""
+        with self._lock:
+            self._cleanup_callback = callback
+            self._verbose = verbose
+
+    def update_activity(self):
+        """Update the last activity timestamp and reset timer"""
+        with self._lock:
+            self.last_activity_time = time.time()
+            self._restart_timer()
+
+    def _restart_timer(self):
+        """Internal method to restart the timer (must be called with lock held)"""
+        # Cancel existing timer
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+        # Start new timer if timeout is enabled
+        if self.buffer_timeout > 0:
+            self._timer = threading.Timer(self.buffer_timeout, self._on_timeout)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _on_timeout(self):
+        """Called when timer expires - directly cleans the buffer"""
+        with self._lock:
+            if self._verbose >= 1:
+                sys.stderr.write(f"Buffer timeout reached ({self.buffer_timeout}s), clearing buffer\n")
+
+            # Call the cleanup callback if set
+            if self._cleanup_callback is not None:
+                try:
+                    self._cleanup_callback()
+                except Exception as ex:
+                    sys.stderr.write(f"Error in buffer cleanup: {ex}\n")
+
+            # Also set the flag as a backup
+            self.clear_buffer = True
+
+    def start_timer(self):
+        """Start or restart the timer"""
+        print("Starting timer")
+        with self._lock:
+            self.last_activity_time = time.time()
+            self._restart_timer()
+
+    def stop_timer(self):
+        """Stop the timer"""
+        print("Stopping timer")
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+
+    def set_timeout(self, timeout):
+        """Change the timeout value and restart timer"""
+        with self._lock:
+            self.buffer_timeout = timeout
+            self._restart_timer()
+
 DICTATION_CONTROL = DictationControl()
 
 TEMP_COOKIE_NAME = "nerd-dictation.cookie"
@@ -1048,6 +1119,23 @@ def text_from_vosk_pipe(
     # -----------------------------
     # Utilities for Text Processing
 
+    def cleanup_buffer_from_timer():
+        """Called asynchronously by the timer thread to clean up the buffer"""
+        nonlocal handled_any
+        nonlocal text_prev
+        nonlocal json_text_partial_prev
+
+        # Clear all buffer state
+        if not (progressive and progressive_continuous):
+            text_list.clear()
+
+        text_prev = ""
+        json_text_partial_prev = ""
+
+        print("Buffer emptied")
+
+    DICTATION_CONTROL.set_cleanup_callback(cleanup_buffer_from_timer, verbose=verbose)
+
     def handle_fn_suspended() -> None:
         nonlocal handled_any
         nonlocal text_prev
@@ -1060,9 +1148,14 @@ def text_from_vosk_pipe(
         if not (progressive and progressive_continuous):
             text_list.clear()
 
+        DICTATION_CONTROL.stop_timer()
+
     def handle_fn_wrapper(text: str, is_partial_arg: bool) -> None:
         nonlocal handled_any
         nonlocal text_prev
+
+        # Update activity time when processing ANY text
+        DICTATION_CONTROL.update_activity()
 
         # Simple deferred text input, just accumulate values in a list (finish entering text on exit).
         if not progressive:
@@ -1209,6 +1302,9 @@ def text_from_vosk_pipe(
         if not suspend:
             return
         suspend = False
+
+        if DICTATION_CONTROL.buffer_timeout > 0:
+            DICTATION_CONTROL.start_timer()
 
     def handle_sig_reload_from_hup(_signum: int, _frame: Optional[FrameType]) -> None:
         if verbose >= 1:
@@ -1398,6 +1494,13 @@ def main_begin(
         sys.stderr.write("Cookie removed after right after creation (unlikely but respect the request)\n")
         return
 
+    buffer_timeout = 60 #sec
+    DICTATION_CONTROL.set_timeout(buffer_timeout)
+    if buffer_timeout > 0:
+        DICTATION_CONTROL.start_timer()
+        if verbose >= 1:
+            sys.stderr.write(f"Buffer auto-clear enabled: {buffer_timeout}s timeout\n")
+
     #
     # Start recording the output file.
     #
@@ -1582,6 +1685,8 @@ def main_suspend(
         if verbose >= 1:
             sys.stderr.write("Failed to read PID with error {!r}, abort!\n".format(ex))
         return
+
+    DICTATION_CONTROL.stop_timer()
 
     if suspend:
         os.kill(pid, signal.SIGUSR1)
