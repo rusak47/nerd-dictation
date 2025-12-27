@@ -77,7 +77,7 @@ class DictationControl:
     def set_cleanup_callback(self, callback, verbose=0):
         """Set the callback function that will clean up the buffer"""
         with self._lock:
-            self._cleanup_callback = callback
+            self._cleanup_callback = lambda: callback(self)
             self._verbose = verbose
 
     def update_activity(self):
@@ -102,8 +102,11 @@ class DictationControl:
     def _on_timeout(self):
         """Called when timer expires - directly cleans the buffer"""
         with self._lock:
-            if self._verbose >= 1:
+            if self._verbose >= 2:
                 sys.stderr.write(f"Buffer timeout reached ({self.buffer_timeout}s), clearing buffer\n")
+
+            # Also set the flag as a backup (will be reset inside callback)
+            self.clear_buffer = True
 
             # Call the cleanup callback if set
             if self._cleanup_callback is not None:
@@ -112,19 +115,19 @@ class DictationControl:
                 except Exception as ex:
                     sys.stderr.write(f"Error in buffer cleanup: {ex}\n")
 
-            # Also set the flag as a backup
-            self.clear_buffer = True
 
     def start_timer(self):
         """Start or restart the timer"""
-        print("Starting timer")
+        if self._verbose >= 2:
+            sys.stderr.write("Starting buffer cleanup timer")
         with self._lock:
             self.last_activity_time = time.time()
             self._restart_timer()
 
     def stop_timer(self):
         """Stop the timer"""
-        print("Stopping timer")
+        if self._verbose >= 2:
+            sys.stderr.write("Stopping buffer cleanup timer")
         with self._lock:
             if self._timer is not None:
                 self._timer.cancel()
@@ -135,6 +138,10 @@ class DictationControl:
         with self._lock:
             self.buffer_timeout = timeout
             self._restart_timer()
+
+    def set_verbose(self, verbose:bool):
+        with self._lock:
+            self._verbose = verbose
 
 DICTATION_CONTROL = DictationControl()
 
@@ -1116,23 +1123,28 @@ def text_from_vosk_pipe(
     # Track this to prevent excessive load when the "partial" result doesn't change.
     json_text_partial_prev = ""
 
+    # start auto cleanup timer if not sspending, otherwise it will be called on resume
+    if not suspend_on_start and DICTATION_CONTROL.buffer_timeout > 0:
+        DICTATION_CONTROL.start_timer()
+
     # -----------------------------
     # Utilities for Text Processing
-
-    def cleanup_buffer_from_timer():
+    def cleanup_buffer_from_timer(dictation_control:DictationControl):
         """Called asynchronously by the timer thread to clean up the buffer"""
+        dictation_control.clear_buffer = False
+
         nonlocal handled_any
         nonlocal text_prev
         nonlocal json_text_partial_prev
+        nonlocal text_list
 
         # Clear all buffer state
-        if not (progressive and progressive_continuous):
-            text_list.clear()
-
+        text_list.clear()
         text_prev = ""
         json_text_partial_prev = ""
 
-        print("Buffer emptied")
+        if verbose >= 2:
+            sys.stderr.write("Buffer emptied.\n")
 
     DICTATION_CONTROL.set_cleanup_callback(cleanup_buffer_from_timer, verbose=verbose)
 
@@ -1172,15 +1184,14 @@ def text_from_vosk_pipe(
             text_curr = process_fn(" ".join(text_list + [text]), text_prev)
 
             if DICTATION_CONTROL.clear_buffer:
-               DICTATION_CONTROL.clear_buffer = False
-               text_list.clear()
-               text_prev = ""
-               text_curr = ""
-               handled_any = True
-               return
+                DICTATION_CONTROL._on_timeout()
+                text_curr = ""
+                handled_any = True
+                return
 
         if text_curr != text_prev:
-            print(f"prev: {text_prev}; curr: {text_curr}")
+            if verbose >= 3:
+                sys.stderr.write(f"prev: {text_prev}; curr: {text_curr}")
             match = min(len(text_curr), len(text_prev))
             for i in range(min(len(text_curr), len(text_prev))):
                 if text_curr[i] != text_prev[i]:
@@ -1411,7 +1422,6 @@ def text_from_vosk_pipe(
 
     return handled_any
 
-
 def main_begin(
     *,
     vosk_model_dir: str,
@@ -1428,6 +1438,7 @@ def main_begin(
     numbers_min_value: Optional[int] = None,
     numbers_no_suffix: bool = False,
     timeout: float = 0.0,
+    buffer_timeout: float = 0.0,
     idle_time: float = 0.0,
     delay_exit: float = 0.0,
     punctuate_from_previous_timeout: float = 0.0,
@@ -1457,9 +1468,9 @@ def main_begin(
     _ensure_state_dir()
 
     if not path_to_cookie:
-        #path_to_cookie = os.path.join(tempfile.gettempdir(), TEMP_COOKIE_NAME)
         path_to_cookie = _pidfile(lang)
-    print(f"{path_to_cookie}")
+    if verbose >= 1:
+        sys.stderr.write(f"Path to process cookie: {path_to_cookie}")
 
     # Check if another instance of this language is already running
     if os.path.exists(path_to_cookie):
@@ -1494,12 +1505,10 @@ def main_begin(
         sys.stderr.write("Cookie removed after right after creation (unlikely but respect the request)\n")
         return
 
-    buffer_timeout = 60 #sec
+    DICTATION_CONTROL.set_verbose(verbose)
     DICTATION_CONTROL.set_timeout(buffer_timeout)
-    if buffer_timeout > 0:
-        DICTATION_CONTROL.start_timer()
-        if verbose >= 1:
-            sys.stderr.write(f"Buffer auto-clear enabled: {buffer_timeout}s timeout\n")
+    if buffer_timeout > 0 and verbose >= 1:
+        sys.stderr.write(f"Buffer auto-clear enabled: {buffer_timeout}s timeout\n")
 
     #
     # Start recording the output file.
@@ -1866,6 +1875,20 @@ def subparse_creat_begin_add_arguments(subparse):
                    )
 
     subparse.add_argument(
+        "--buffer-cleanup-timeout",
+        dest="buffer_timeout",
+        default=0.0,
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "Automatically clear the text buffer after this many seconds of inactivity.\n"
+            "Each language instance has its own timer.\n"
+            "Useful for starting fresh sentences after pauses (zero disables)."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
         "--config",
         default=None,
         dest="config",
@@ -2172,6 +2195,7 @@ def subparse_creat_begin_add_arguments(subparse):
             numbers_min_value=args.numbers_min_value,
             numbers_no_suffix=args.numbers_no_suffix,
             timeout=args.timeout,
+            buffer_timeout=args.buffer_timeout,
             idle_time=min(args.idle_time, 0.5),
             delay_exit=args.delay_exit,
             punctuate_from_previous_timeout=args.punctuate_from_previous_timeout,
