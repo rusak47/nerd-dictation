@@ -1830,6 +1830,7 @@ def cmd_suspend(args):
 def cmd_cancel(args):
     """Stop all running dictation instances."""
     _ensure_state_dir()
+    target_lang = args.lang
 
     found_any = False
     for fn in os.listdir(STATE_DIR):
@@ -1840,9 +1841,10 @@ def cmd_cancel(args):
         if not lang:
             continue
 
-        main_cancel(path_to_cookie=_pidfile(lang))
-        found_any = True
-        sys.stderr.write(f"✓ Stopped '{lang}'\n")
+        if lang == target_lang or not target_lang:
+            main_cancel(path_to_cookie=_pidfile(lang))
+            found_any = True
+            sys.stderr.write(f"✓ Stopped '{lang}'\n")
 
     if not found_any:
         sys.stderr.write("No dictation instances running.\n")
@@ -2273,6 +2275,10 @@ This ends dictation, causing the text to be typed in.
     )
 
     argparse_generic_command_cookie(subparse)
+    subparse.add_argument("--lang",
+                          default="",
+                          help="Language code (e.g. en, ru)"
+                          )
 
     subparse.set_defaults(
         func=lambda args: main_end(
@@ -2290,8 +2296,14 @@ def argparse_create_cancel(subparsers: "argparse._SubParsersAction[argparse.Argu
     )
 
     argparse_generic_command_cookie(subparse)
+    subparse.add_argument("--lang",
+                          default="",
+                          help="Language code (e.g. en, ru)"
+                          )
 
-    subparse.set_defaults(func=cmd_cancel)
+    subparse.set_defaults(
+        func=cmd_cancel
+    )
 
 
 def argparse_create_suspend(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
